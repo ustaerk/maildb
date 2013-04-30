@@ -1,0 +1,364 @@
+=head1 NAME
+
+maildb
+
+$Id: maildb 7 2006-01-24 08:44:14Z uli $
+
+=head1 DESCRIPTION
+
+This qpsmtpd plugin archives mail and stores metadata for later search in
+a SQL database.
+
+=head1 RESTRICTIONS
+
+=over 4
+
+=item *
+
+The user under which qpsmtpd runs must have write access to the
+directory configured as <archive_root> (see below).
+
+=item *
+
+You can use whatever DBMS you like as long as your table for storing
+the metadata looks similar to that (you can use the following SQL statement
+to create a table 'mail' in MySQL; ommit the fulltext key if you don't want
+support for fulltext search):
+
+ CREATE TABLE `mail` (
+   `uid` bigint(20) unsigned NOT NULL auto_increment,
+   `recipient` varchar(255) NOT NULL default '',
+   `sender` varchar(255) NOT NULL default '',
+   `date` datetime NOT NULL default '0000-00-00 00:00:00',
+   `subject` text NOT NULL,
+   `data` text,
+   `attachments` text,
+   `mail` varchar(255) default NULL,
+   PRIMARY KEY  (`uid`),
+   FULLTEXT KEY `volltext` (`recipient`,`sender`,`subject`,`data`,`attachments`)
+ ) TYPE=MyISAM;
+
+
+=item *
+
+Your DBMS has to unterstand FROM_UNIXTIME() in a SQL statement. If it doesn't,
+alter the SQL code in this file.
+
+=back
+
+=head1 INSTALLATION AND CONFIGURATION
+
+Place this plugin into the plugin directory beneath your qpsmtpd installation. You
+can then load it by putting 
+
+ maildb data_source <data_source> database_user <database_user> database_password <database_password> archive_root <archive_root>
+
+into your config/plugins file.
+
+maildb understands the following options:
+
+
+=over 4
+
+=item B<data_source> (mandatory)
+
+Data source string for connecting to your database using DBI, e.g. 'DBI:mysql:mail:localhost:3306'
+
+=item B<database_user> (mandatory)
+
+Username to connect with
+
+=item B<database_password> (mandatory)
+
+The database user's password
+
+=item B<archive_root> (mandatory)
+
+Directory beneath which mail will get stored (notice: qpsmtpd will need write access for it)
+
+=back
+
+=head1 REQUIREMENTS
+
+maildb requires the following Perl modules:
+
+=over 4
+
+=item B<DBI :>
+
+L<http://search.cpan.org/~timb/DBI-1.50/>
+
+=item B<DBD::mysql :>
+
+L<http://search.cpan.org/~jwied/Msql-Mysql-modules-1.2219/>
+
+=item B<Date::Parse :>
+
+L<http://search.cpan.org/~gbarr/TimeDate-1.16/>
+
+=item B<MIME::Parser, MIME::Words :>
+
+L<http://search.cpan.org/~dskoll/MIME-tools-5.419/>
+
+
+=back
+
+=head1 AUTHOR
+
+Ulrich Staerk, SiNMA GmbH, L<http://www.sinma.de>
+Ulrich Staerk, uli@apache.org
+
+=head1 COPYRIGHT AND LICENSE
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+=cut
+
+
+use POSIX qw:strftime:;
+use DBI;
+use Date::Parse;
+use MIME::Parser;
+use MIME::Words qw(:all);
+use IO::File;
+use File::Path;
+
+#my $_dbh;
+
+sub register {
+  my ($self, $qp, @args) = @_;
+  $self->log(LOGDEBUG, "maildb: register()");
+
+  %{$self->{_maildb}} = @args;
+
+
+  $self->log(LOGERROR, "No data source supplied!") and die "No data source supplied!"
+    if ! defined $self->{_maildb}->{data_source} or $self->{_maildb}->{data_source} eq "";
+  $self->log(LOGERROR, "No database user supplied!") and die "No database user supplied!"
+    if ! defined $self->{_maildb}->{database_user} or $self->{_maildb}->{database_user} eq "";
+  $self->log(LOGERROR, "No database password supplied!") and die "No database password supplied!"
+    if ! defined $self->{_maildb}->{database_password} or $self->{_maildb}->{database_password} eq "";
+  $self->log(LOGERROR, "No archive root supplied!") and die "No archive root supplied!"
+    if ! defined $self->{_maildb}->{archive_root} or $self->{_maildb}->{archive_root} eq "";
+  
+  # initialize and test the database connection
+  my $dbh = db_connect($self);
+  $dbh->disconnect();
+}
+
+sub db_connect {
+  my ($self) = @_;
+  $self->log(LOGDEBUG, "maildb: db_connect()");
+  # caching the database connection causes me to die when
+  # running qpsmtpd-forkserver in daemon mode. threading problem?
+
+  #$_dbh->ping crashes when run daemonized.
+  #if($_dbh && $_dbh->ping) {
+  #  $self->log(LOGDEBUG, "maildb: db_connect(): found dbh");
+  #  return $_dbh;
+  #} else {
+  #  $self->log(LOGDEBUG, "maildb: db_connect(): create dbh");
+  #  $_dbh = DBI->connect($self->{_maildb}->{data_source},
+  #                       $self->{_maildb}->{database_user},
+  #                       $self->{_maildb}->{database_password},
+  #                       { PrintError => 0}) or
+  #    $self->log(LOGWARN, "WARNING: Could not connect to database with supplied arguments!");
+  #  return $_dbh;
+  #}
+  return DBI->connect($self->{_maildb}->{data_source},
+                      $self->{_maildb}->{database_user},
+                      $self->{_maildb}->{database_password},
+                      { PrintError => 0}) or
+    $self->log(LOGWARN, "WARNING: Could not connect to database with supplied arguments!");
+}
+
+sub hook_data_post {
+  my ($self, $transaction) = @_;
+  $self->log(LOGDEBUG, "maildb: hook_data_post()");
+  
+  # we don't want to archive spam...
+  if($transaction->header->get('X-Spam-Flag') eq 'YES') {
+    return (DECLINED, "Spam. Yummie. But I don't want to store that...");
+  }
+
+  my $archivroot = $self->{_maildb}->{archive_root};
+  # untaint. make better.
+  $archivroot =~ /(.*)/;
+  $archivroot = $1;
+
+  my $mailbody;
+  $transaction->body_resetpos;
+  while (my $line = $transaction->body_getline) {
+    $mailbody .= $line;
+  }
+  my $mail = $transaction->header->as_string . $mailbody;
+  $mailbody = undef;
+
+  # parse the mail - again. we have to do this because we
+  # want to store a single text part into the db
+  $self->log(LOGDEBUG, "maildb: parsing mail");
+  my $parser = new MIME::Parser;
+  $parser->output_to_core(1);
+  $parser->extract_nested_messages(0);
+  my $entity = $parser->parse_data($mail);
+  
+  # process headers. we could get them via $transaction
+  # but we parsed the mail anyway.
+  $self->log(LOGDEBUG, "maildb: processing headers");
+  my $head = $entity->head();
+
+  # get the email's date and prepare it for storing
+  my $datestring = $head->get('date');
+  chomp $datestring;
+  my $timestamp = str2time($datestring);
+  $timestamp = 0 if ! defined($timestamp) or $timestamp < 0;
+
+  # get subject, sender and recipient. escape "\" and "'"
+  # $dbh->quote won't work here because all fields might contain
+  # newlines (\n).
+  my $subject = $head->get('subject');
+  chomp $subject;
+  $subject = myquote($subject);
+  # any field might contain some non-human-readable mime-gibberish
+  # try to decode it so that we can search for the real text
+  $subject = decode_mimewords($subject);
+
+  my $sender = $head->get('from');
+  $sender = myquote($sender);
+  chomp $sender;
+  $sender = decode_mimewords($sender);
+
+  my $recipient = $head->get('to');
+  chomp $recipient;
+  $recipient = myquote($recipient);
+  $recipient = decode_mimewords($recipient);
+  
+  # there surely is no user MAILER-DAEMON. this is most likely a bounce
+  # triggered by a bounce
+  if($recipient =~ /MAILER-DAEMON/) {
+    return (DECLINED, "I don't want to archive bounce loops.");
+  }
+
+  # find attachments in mail.
+  $self->log(LOGDEBUG, "maildb: find attachments");
+  my @attachments;
+  foreach my $part($entity->parts) {
+    my $filename = $part->head->recommended_filename;
+    my $word = "";
+    $word = decode_mimewords($filename) if $filename;
+    $word = myquote($word);
+    push @attachments,$word."\n" if ! $word eq "";
+  }
+
+  my $year = strftime "%Y", localtime($timestamp);
+  my $month = strftime "%m", localtime($timestamp);
+  my $day = strftime "%d", localtime($timestamp);
+
+  # check for a human readable body (content-type text/*)
+  # that we can put into the db
+  $self->log(LOGDEBUG, "maildb: find body");
+  my $body=findbody($entity);
+  my $bodystring="";
+  my $query;
+  if(defined($body)) {
+    # found one, get and quote it and prepare the query
+    $bodystring=$body->as_string();
+    $bodystring = decode_mimewords($bodystring);
+    $bodystring = myquote($bodystring);
+    $query = "INSERT INTO mail(recipient,sender,date,subject,data,attachments) VALUES('$recipient','$sender',FROM_UNIXTIME($timestamp),'$subject','$bodystring','@attachments')";
+  } else { # no content-type text/* body found so leave it blank
+    $query = "INSERT INTO mail(recipient,sender,date,subject,attachments) VALUES('$recipient','$sender',FROM_UNIXTIME($timestamp),'$subject','@attachments')";
+  }
+
+  $self->log(LOGDEBUG, "maildb: connecting to db");
+  my $dbh = db_connect($self);
+  return (DECLINED, "Could not connect to database ".$self->{_maildb}->{data_source}) if ! $dbh;
+
+  # put metadata into the archive db
+  $self->log(LOGDEBUG, "maildb: store metadata");
+  my $sth = $dbh->prepare($query);
+  if(!$sth->execute()) {
+    my $mesg = "ERROR: Error inserting mail into DB: ".$sth->errstr.". Query: ".$query.".";
+    $self->log(LOGERROR, $mesg);
+    return (DECLINED, $mesg);
+  }
+  my $msgid = $sth->{mysql_insertid};
+
+  # we know the msgid only after inserting the metadata. update
+  # the path to the archive file now.
+  $self->log(LOGDEBUG, "maildb: update path to mail");
+  $sth = $dbh->prepare("UPDATE mail SET mail='$archivroot/$year/$month/$day/$msgid/email.txt' WHERE uid=$msgid");
+  if(!$sth->execute()) {
+    my $mesg = "ERROR: Error setting path to mailfile: ".$sth->errstr.". Query: ".$query.".";
+    $self->log(LOGERROR, $mesg);
+    return (DECLINED, $mesg);
+  }
+
+  # create path to archive file if necessary
+  if(! -d "$archivroot/$year/$month/$day/$msgid") {
+    # change umask to something more restrictive
+    $self->log(LOGDEBUG, "maildb: create archive path");
+    mkpath("$archivroot/$year/$month/$day/$msgid",0,0770);
+  }
+
+  # write complete mail to archive file
+  $self->log(LOGDEBUG, "maildb: open archive file");
+  if(! open(EMAIL, "+>", "$archivroot/$year/$month/$day/$msgid/email.txt")) {
+    $self->log(LOGERROR, "ERROR: Could not open file for writing: $archivroot/$year/$month/$day/$msgid/email.txt");
+    return (DECLINED, "ERROR: Could not open file for writing: $archivroot/$year/$month/$day/$msgid/email.txt");
+  }
+  $self->log(LOGDEBUG, "maildb: write to archive file");
+  if(! print EMAIL $mail) {
+    $self->log(LOGERROR, "ERROR: Could not write to file: $archivroot/$year/$month/$day/$msgid/email.txt");
+    return (DECLINED, "ERROR: Could not write to file: $archivroot/$year/$month/$day/$msgid/email.txt");
+  }
+  close EMAIL;
+
+  # close database connection
+  $dbh->disconnect();
+
+  return (DECLINED, "successfully saved message to db... continuing");
+}
+
+# find the first text/* part in a message
+# and return it as a Mime::Body
+sub findbody {
+  my ($entity) = @_;
+  if($entity->mime_type =~ /text/) {
+    return $entity->bodyhandle();
+  } elsif ($entity->is_multipart()) {
+    foreach my $ent($entity->parts) {
+      my $body = findbody($ent);
+      if(defined($body)) {
+        return $body
+      }
+    }
+    return undef;
+  } else {
+    return undef;
+  }
+}
+
+# prepare some string for database insertion
+sub myquote {
+  my ($toquote) = @_;
+  $toquote =~ s/\\/\\\\/g;
+  $toquote =~ s/'/''/g;
+  return $toquote;
+}  
